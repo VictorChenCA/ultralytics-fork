@@ -1,6 +1,9 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import torch
+import numpy as np
+from sklearn.metrics import precision_recall_curve, roc_curve, f1_score, precision_score, recall_score, auc
+import wandb
 
 from ultralytics.data import ClassificationDataset, build_dataloader
 from ultralytics.engine.validator import BaseValidator
@@ -10,73 +13,18 @@ from ultralytics.utils.plotting import plot_images
 
 
 class ClassificationValidator(BaseValidator):
-    """
-    A class extending the BaseValidator class for validation based on a classification model.
-
-    This validator handles the validation process for classification models, including metrics calculation,
-    confusion matrix generation, and visualization of results.
-
-    Attributes:
-        targets (List[torch.Tensor]): Ground truth class labels.
-        pred (List[torch.Tensor]): Model predictions.
-        metrics (ClassifyMetrics): Object to calculate and store classification metrics.
-        names (dict): Mapping of class indices to class names.
-        nc (int): Number of classes.
-        confusion_matrix (ConfusionMatrix): Matrix to evaluate model performance across classes.
-
-    Methods:
-        get_desc: Return a formatted string summarizing classification metrics.
-        init_metrics: Initialize confusion matrix, class names, and tracking containers.
-        preprocess: Preprocess input batch by moving data to device.
-        update_metrics: Update running metrics with model predictions and batch targets.
-        finalize_metrics: Finalize metrics including confusion matrix and processing speed.
-        postprocess: Extract the primary prediction from model output.
-        get_stats: Calculate and return a dictionary of metrics.
-        build_dataset: Create a ClassificationDataset instance for validation.
-        get_dataloader: Build and return a data loader for classification validation.
-        print_results: Print evaluation metrics for the classification model.
-        plot_val_samples: Plot validation image samples with their ground truth labels.
-        plot_predictions: Plot images with their predicted class labels.
-
-    Examples:
-        >>> from ultralytics.models.yolo.classify import ClassificationValidator
-        >>> args = dict(model="yolo11n-cls.pt", data="imagenet10")
-        >>> validator = ClassificationValidator(args=args)
-        >>> validator()
-
-    Notes:
-        Torchvision classification models can also be passed to the 'model' argument, i.e. model='resnet18'.
-    """
-
     def __init__(self, dataloader=None, save_dir=None, pbar=None, args=None, _callbacks=None):
-        """
-        Initialize ClassificationValidator with dataloader, save directory, and other parameters.
-
-        Args:
-            dataloader (torch.utils.data.DataLoader, optional): Dataloader to use for validation.
-            save_dir (str | Path, optional): Directory to save results.
-            pbar (bool, optional): Display a progress bar.
-            args (dict, optional): Arguments containing model and validation configuration.
-            _callbacks (list, optional): List of callback functions to be called during validation.
-
-        Examples:
-            >>> from ultralytics.models.yolo.classify import ClassificationValidator
-            >>> args = dict(model="yolo11n-cls.pt", data="imagenet10")
-            >>> validator = ClassificationValidator(args=args)
-            >>> validator()
-        """
         super().__init__(dataloader, save_dir, pbar, args, _callbacks)
-        self.targets = None
-        self.pred = None
+        self.targets = []
+        self.pred = []
+        self.probs = []
         self.args.task = "classify"
         self.metrics = ClassifyMetrics()
 
     def get_desc(self):
-        """Return a formatted string summarizing classification metrics."""
         return ("%22s" + "%11s" * 2) % ("classes", "top1_acc", "top5_acc")
 
     def init_metrics(self, model):
-        """Initialize confusion matrix, class names, and tracking containers for predictions and targets."""
         self.names = model.names
         self.nc = len(model.names)
         self.confusion_matrix = ConfusionMatrix(
@@ -84,45 +32,21 @@ class ClassificationValidator(BaseValidator):
         )
         self.pred = []
         self.targets = []
+        self.probs = []
 
     def preprocess(self, batch):
-        """Preprocess input batch by moving data to device and converting to appropriate dtype."""
         batch["img"] = batch["img"].to(self.device, non_blocking=True)
         batch["img"] = batch["img"].half() if self.args.half else batch["img"].float()
         batch["cls"] = batch["cls"].to(self.device)
         return batch
 
     def update_metrics(self, preds, batch):
-        """
-        Update running metrics with model predictions and batch targets.
-
-        Args:
-            preds (torch.Tensor): Model predictions, typically logits or probabilities for each class.
-            batch (dict): Batch data containing images and class labels.
-
-        Notes:
-            This method appends the top-N predictions (sorted by confidence in descending order) to the
-            prediction list for later evaluation. N is limited to the minimum of 5 and the number of classes.
-        """
         n5 = min(len(self.names), 5)
         self.pred.append(preds.argsort(1, descending=True)[:, :n5].type(torch.int32).cpu())
         self.targets.append(batch["cls"].type(torch.int32).cpu())
+        self.probs.append(preds.softmax(dim=1).detach().cpu())
 
-    def finalize_metrics(self) -> None:
-        """
-        Finalize metrics including confusion matrix and processing speed.
-
-        Notes:
-            This method processes the accumulated predictions and targets to generate the confusion matrix,
-            optionally plots it, and updates the metrics object with speed information.
-
-        Examples:
-            >>> validator = ClassificationValidator()
-            >>> validator.pred = [torch.tensor([[0, 1, 2]])]  # Top-3 predictions for one sample
-            >>> validator.targets = [torch.tensor([0])]  # Ground truth class
-            >>> validator.finalize_metrics()
-            >>> print(validator.metrics.confusion_matrix)  # Access the confusion matrix
-        """
+    def finalize_metrics(self):
         self.confusion_matrix.process_cls_preds(self.pred, self.targets)
         if self.args.plots:
             for normalize in True, False:
@@ -132,74 +56,60 @@ class ClassificationValidator(BaseValidator):
         self.metrics.save_dir = self.save_dir
 
     def postprocess(self, preds):
-        """Extract the primary prediction from model output if it's in a list or tuple format."""
         return preds[0] if isinstance(preds, (list, tuple)) else preds
 
     def get_stats(self):
-        """Calculate and return a dictionary of metrics by processing targets and predictions."""
         self.metrics.process(self.targets, self.pred)
-        return self.metrics.results_dict
+        results = self.metrics.results_dict
+
+        y_true = torch.cat(self.targets).numpy()
+        probs = torch.cat(self.probs).numpy()
+        y_scores = probs[:, self.fake_class_index()]  # assumes binary classification
+
+        precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+        f1s = 2 * precision * recall / (precision + recall + 1e-16)
+        best_f1_idx = np.argmax(f1s)
+        best_threshold = thresholds[best_f1_idx]
+
+        for t in [0.25, 0.5, 0.75, best_threshold]:
+            preds_t = (y_scores >= t).astype(int)
+            wandb.log({
+                f"F1@{t:.2f}": f1_score(y_true, preds_t),
+                f"Precision@{t:.2f}": precision_score(y_true, preds_t),
+                f"Recall@{t:.2f}": recall_score(y_true, preds_t)
+            })
+
+        wandb.log({
+            "PR AUC": auc(recall, precision),
+            "ROC AUC": auc(*roc_curve(y_true, y_scores)[:2]),
+            "PR Curve": wandb.plot.pr_curve(y_true, y_scores, labels=["fake"]),
+            "ROC Curve": wandb.plot.roc_curve(y_true, y_scores, labels=["fake"])
+        })
+
+        return results
 
     def build_dataset(self, img_path):
-        """Create a ClassificationDataset instance for validation."""
         return ClassificationDataset(root=img_path, args=self.args, augment=False, prefix=self.args.split)
 
     def get_dataloader(self, dataset_path, batch_size):
-        """
-        Build and return a data loader for classification validation.
-
-        Args:
-            dataset_path (str | Path): Path to the dataset directory.
-            batch_size (int): Number of samples per batch.
-
-        Returns:
-            (torch.utils.data.DataLoader): DataLoader object for the classification validation dataset.
-        """
         dataset = self.build_dataset(dataset_path)
         return build_dataloader(dataset, batch_size, self.args.workers, rank=-1)
 
     def print_results(self):
-        """Print evaluation metrics for the classification model."""
-        pf = "%22s" + "%11.3g" * len(self.metrics.keys)  # print format
+        pf = "%22s" + "%11.3g" * len(self.metrics.keys)
         LOGGER.info(pf % ("all", self.metrics.top1, self.metrics.top5))
 
     def plot_val_samples(self, batch, ni):
-        """
-        Plot validation image samples with their ground truth labels.
-
-        Args:
-            batch (dict): Dictionary containing batch data with 'img' (images) and 'cls' (class labels).
-            ni (int): Batch index used for naming the output file.
-
-        Examples:
-            >>> validator = ClassificationValidator()
-            >>> batch = {"img": torch.rand(16, 3, 224, 224), "cls": torch.randint(0, 10, (16,))}
-            >>> validator.plot_val_samples(batch, 0)
-        """
         plot_images(
             images=batch["img"],
             batch_idx=torch.arange(len(batch["img"])),
-            cls=batch["cls"].view(-1),  # warning: use .view(), not .squeeze() for Classify models
+            cls=batch["cls"].view(-1),
             fname=self.save_dir / f"val_batch{ni}_labels.jpg",
             names=self.names,
             on_plot=self.on_plot,
         )
 
     def plot_predictions(self, batch, preds, ni):
-        """
-        Plot images with their predicted class labels and save the visualization.
-
-        Args:
-            batch (dict): Batch data containing images and other information.
-            preds (torch.Tensor): Model predictions with shape (batch_size, num_classes).
-            ni (int): Batch index used for naming the output file.
-
-        Examples:
-            >>> validator = ClassificationValidator()
-            >>> batch = {"img": torch.rand(16, 3, 224, 224)}
-            >>> preds = torch.rand(16, 10)  # 16 images, 10 classes
-            >>> validator.plot_predictions(batch, preds, 0)
-        """
         plot_images(
             batch["img"],
             batch_idx=torch.arange(len(batch["img"])),
@@ -207,4 +117,7 @@ class ClassificationValidator(BaseValidator):
             fname=self.save_dir / f"val_batch{ni}_pred.jpg",
             names=self.names,
             on_plot=self.on_plot,
-        )  # pred
+        )
+
+    def fake_class_index(self):
+        return [k.lower() for k in self.names.values()].index("fake")
